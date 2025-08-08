@@ -8,15 +8,15 @@ pub mod crypto;
 pub mod generator;
 pub mod opencl;
 pub mod ethereum;
-pub mod monitor;
+pub mod recovery;
 pub mod error;
+pub mod monitor;
 
 // Re-export main types without utils modules to avoid conflicts
 pub use config::{RecoveryConfig, WordConstraint, EthereumConfig};
 pub use crypto::{CryptoEngine, Bip39Seed, DerivedKey, CryptoBatch, BatchResult};
 pub use generator::{CandidateGenerator, Candidate, CandidateBatch, BatchIterator};
 pub use ethereum::{EthereumGenerator, EthereumAddress, EthereumKeyPair};
-pub use monitor::{RecoveryMonitor, MonitorConfig};
 pub use error::*;
 
 /// Re-export commonly used types
@@ -25,7 +25,6 @@ pub mod prelude {
     pub use crate::crypto::{CryptoEngine, Bip39Seed, DerivedKey, CryptoBatch, BatchResult};
     pub use crate::generator::{CandidateGenerator, Candidate, CandidateBatch, BatchIterator};
     pub use crate::ethereum::{EthereumGenerator, EthereumAddress, EthereumKeyPair};
-    pub use crate::monitor::{RecoveryMonitor, MonitorConfig};
     pub use crate::error::*;
     pub use anyhow::{Result, Context};
 }

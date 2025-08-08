@@ -7,10 +7,10 @@ use keccak_hash::keccak;
 use std::fmt;
 
 /// Ethereum address (20 bytes)
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct EthereumAddress {
-    /// The 20-byte address
-    pub address: [u8; 20],
+    /// The 20-byte Ethereum address
+    bytes: [u8; 20],
 }
 
 /// Ethereum public key (64 bytes uncompressed)
@@ -65,7 +65,7 @@ impl EthereumGenerator {
     
     /// Generate Ethereum address from private key
     pub fn generate_address(&self, private_key: &[u8; 32]) -> Result<EthereumKeyPair> {
-        // Create secp256k1 secret key
+        // Create secret key from private key bytes
         let secret_key = SecretKey::from_slice(private_key)
             .map_err(|e| EthereumError::InvalidPrivateKey(e.to_string()))?;
         
@@ -75,7 +75,7 @@ impl EthereumGenerator {
         // Get uncompressed public key bytes (65 bytes with 0x04 prefix)
         let public_key_bytes = public_key.serialize_uncompressed();
         
-        // Remove the 0x04 prefix to get 64 bytes
+        // Remove the 0x04 prefix to get 64-byte Ethereum public key
         let mut eth_public_key = [0u8; 64];
         eth_public_key.copy_from_slice(&public_key_bytes[1..]);
         
@@ -106,7 +106,7 @@ impl EthereumGenerator {
         let mut address = [0u8; 20];
         address.copy_from_slice(&hash.as_bytes()[12..]);
         
-        Ok(EthereumAddress { address })
+        Ok(EthereumAddress { bytes: address })
     }
     
     /// Process a batch of private keys
@@ -189,12 +189,12 @@ impl EthereumGenerator {
         let mut address = [0u8; 20];
         address.copy_from_slice(&bytes);
         
-        Ok(EthereumAddress { address })
+        Ok(EthereumAddress { bytes: address })
     }
     
     /// Check if a generated address matches the target
     pub fn matches_target(&self, generated: &EthereumAddress, target: &EthereumAddress) -> bool {
-        generated.address == target.address
+        generated.bytes == target.bytes
     }
 }
 
@@ -205,24 +205,39 @@ impl Default for EthereumGenerator {
 }
 
 impl EthereumAddress {
-    /// Create from byte array
-    pub fn from_bytes(bytes: [u8; 20]) -> Self {
-        Self { address: bytes }
+    /// Create a new Ethereum address from bytes
+    pub fn new(bytes: [u8; 20]) -> Self {
+        Self { bytes }
     }
     
-    /// Get address as byte slice
+    /// Create from byte array
+    pub fn from_bytes(bytes: [u8; 20]) -> Self {
+        Self { bytes }
+    }
+    
+    /// Get the address bytes as slice
     pub fn as_bytes(&self) -> &[u8] {
-        &self.address
+        &self.bytes
+    }
+    
+    /// Get the address bytes as array
+    pub fn bytes(&self) -> &[u8; 20] {
+        &self.bytes
+    }
+    
+    /// Convert address to bytes array
+    pub fn to_bytes(&self) -> [u8; 20] {
+        self.bytes
     }
     
     /// Convert to hex string with 0x prefix
     pub fn to_hex(&self) -> String {
-        format!("0x{}", hex::encode(self.address))
+        format!("0x{}", hex::encode(self.bytes))
     }
     
     /// Convert to hex string without 0x prefix
     pub fn to_hex_no_prefix(&self) -> String {
-        hex::encode(self.address)
+        hex::encode(self.bytes)
     }
     
     /// Create from hex string (with or without 0x prefix)
@@ -232,7 +247,7 @@ impl EthereumAddress {
     
     /// Convert to checksum address (EIP-55)
     pub fn to_checksum(&self) -> String {
-        let address_hex = hex::encode(self.address);
+        let address_hex = hex::encode(self.bytes);
         let hash = keccak(address_hex.as_bytes());
         
         let mut checksum = String::with_capacity(42);
@@ -445,7 +460,7 @@ mod tests {
         // Verify the structure
         assert_eq!(key_pair.private_key, private_key);
         assert_eq!(key_pair.public_key.key.len(), 64);
-        assert_eq!(key_pair.address.address.len(), 20);
+        assert_eq!(key_pair.address.bytes.len(), 20);
     }
     
     #[test]

@@ -205,3 +205,10 @@ impl From<bip39::Error> for CryptoError {
         CryptoError::Bip39(err.to_string())
     }
 }
+
+/// Convert anyhow::Error to RecoveryError
+impl From<anyhow::Error> for RecoveryError {
+    fn from(err: anyhow::Error) -> Self {
+        RecoveryError::Internal(err.to_string())
+    }
+}

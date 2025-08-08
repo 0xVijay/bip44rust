@@ -53,9 +53,9 @@ pub struct RecoveryMonitor {
     /// Progress bar for visual feedback
     progress_bar: Option<ProgressBar>,
     /// Multi-progress for multiple bars
-    multi_progress: Option<MultiProgress>,
+    _multi_progress: Option<MultiProgress>,
     /// Update interval for progress reporting
-    update_interval: Duration,
+    _update_interval: Duration,
     /// Performance history for rate calculation
     performance_history: Arc<Mutex<Vec<(Instant, u64)>>>,
 }
@@ -134,8 +134,8 @@ impl RecoveryMonitor {
         Self {
             state,
             progress_bar,
-            multi_progress,
-            update_interval: Duration::from_millis(config.update_interval_ms),
+            _multi_progress: multi_progress,
+            _update_interval: Duration::from_millis(config.update_interval_ms),
             performance_history: Arc::new(Mutex::new(Vec::new())),
         }
     }

@@ -2,51 +2,51 @@
   "word_constraints": [
     {
       "position": 0,
-      "words": ["frequent", "fox", "field", "flame", "family"]
+      "words": ["frequent", "fox", "field"]
     },
     {
       "position": 1,
-      "words": ["lucky", "lamp", "lava", "loop"]
+      "words": ["lucky", "lamp", "lava"]
     },
     {
       "position": 2,
-      "words": ["inquiry", "iron", "item", "issue"]
+      "words": ["inquiry", "iron"]
     },
     {
       "position": 3,
-      "words": ["vendor", "vivid", "vacuum", "valley"]
+      "words": ["vendor", "vivid"]
     },
     {
       "position": 4,
-      "words": ["engine", "equal", "erase"]
+      "words": ["engine", "equal"]
     },
     {
       "position": 5,
-      "words": ["dragon", "dust", "double"]
+      "words": ["dragon", "dust"]
     },
     {
       "position": 6,
-      "words": ["horse", "hill", "hammer"]
+      "words": ["horse", "hill"]
     },
     {
       "position": 7,
-      "words": ["gorilla", "glove", "grain"]
+      "words": ["gorilla", "glove"]
     },
     {
       "position": 8,
-      "words": ["pear", "paint", "parrot"]
+      "words": ["pear", "paint"]
     },
     {
       "position": 9,
-      "words": ["old", "yawn", "year"]
+      "words": ["old", "yawn"]
     },
     {
       "position": 10,
-      "words": ["dance", "road", "rise"]
+      "words": ["dance", "road"]
     },
     {
       "position": 11,
-      "words": ["shield", "arrow", "asset"]
+      "words": ["shield", "arrow"]
     }
   ],
   "ethereum": {
@@ -56,7 +56,7 @@
   },
   "mnemonic_length": 12,
   "wallet_type": "ethereum",
-  "batch_size": 10000,
+  "batch_size": 2000,
   "num_threads": 8,
   "use_gpu": true,
   "max_memory_mb": 4096

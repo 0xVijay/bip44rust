@@ -1,17 +1,15 @@
-/*
- * Keccak-256 OpenCL kernel for Ethereum address generation
- * This kernel implements Keccak-256 hashing for converting public keys to Ethereum addresses
- */
+// Keccak-256 OpenCL Kernel for Ethereum Address Generation
+// Implements Keccak-256 hashing algorithm for deriving Ethereum addresses
+// from secp256k1 public keys
 
-#pragma OPENCL EXTENSION cl_khr_int64_base_atomics : enable
-#pragma OPENCL EXTENSION cl_khr_int64_extended_atomics : enable
+#pragma OPENCL EXTENSION cl_khr_byte_addressable_store : enable
 
-// Keccak-256 constants
 #define KECCAK_ROUNDS 24
 #define KECCAK_STATE_SIZE 25
-#define KECCAK_RATE 136  // 1088 bits / 8 = 136 bytes
+#define KECCAK_RATE 136  // 1088 bits / 8 = 136 bytes for Keccak-256
 #define KECCAK_CAPACITY 64  // 512 bits / 8 = 64 bytes
-#define KECCAK_DIGEST_SIZE 32  // 256 bits / 8 = 32 bytes
+#define ETHEREUM_ADDRESS_SIZE 20
+#define PUBLIC_KEY_SIZE 64
 
 // Keccak round constants
 __constant ulong keccak_round_constants[24] = {
@@ -20,7 +18,7 @@ __constant ulong keccak_round_constants[24] = {
     0x000000000000008aUL, 0x0000000000000088UL, 0x0000000080008009UL, 0x8000000000008003UL,
     0x8000000000008002UL, 0x8000000000000080UL, 0x000000000000800aUL, 0x800000008000000aUL,
     0x8000000080008081UL, 0x8000000000008080UL, 0x0000000080000001UL, 0x8000000080008008UL,
-    0x8000000000000000UL, 0x8000000080008082UL, 0x800000000000808aUL, 0x8000000080000000UL
+    0x0000000000008082UL, 0x0000000080008003UL, 0x8000000080000002UL, 0x8000000080008080UL
 };
 
 // Rotation offsets for Keccak
@@ -28,303 +26,291 @@ __constant int keccak_rotation_offsets[24] = {
     1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 2, 14, 27, 41, 56, 8, 25, 43, 62, 18, 39, 61, 20, 44
 };
 
-// Keccak permutation indices
-__constant int keccak_pi_indices[24] = {
-    10, 7, 11, 17, 18, 3, 5, 16, 8, 21, 24, 4, 15, 23, 19, 13, 12, 2, 20, 14, 22, 9, 6, 1
-};
+// Left rotation for 64-bit values
+#define ROTL64(x, n) (((x) << (n)) | ((x) >> (64 - (n))))
 
-// Utility functions
-ulong rotl64(ulong x, int n) {
-    return (x << n) | (x >> (64 - n));
+// Convert bytes to 64-bit little-endian
+ulong bytes_to_u64_le(const uchar* bytes, int offset) {
+    return ((ulong)bytes[offset]) |
+           ((ulong)bytes[offset + 1] << 8) |
+           ((ulong)bytes[offset + 2] << 16) |
+           ((ulong)bytes[offset + 3] << 24) |
+           ((ulong)bytes[offset + 4] << 32) |
+           ((ulong)bytes[offset + 5] << 40) |
+           ((ulong)bytes[offset + 6] << 48) |
+           ((ulong)bytes[offset + 7] << 56);
 }
 
-// Convert bytes to 64-bit words (little-endian)
-void bytes_to_state(const uchar* input, ulong* state, int input_len) {
-    // Initialize state to zero
-    for (int i = 0; i < KECCAK_STATE_SIZE; i++) {
-        state[i] = 0;
-    }
-    
-    // Load input bytes into state (little-endian)
-    for (int i = 0; i < input_len; i++) {
-        int word_idx = i / 8;
-        int byte_idx = i % 8;
-        state[word_idx] |= ((ulong)input[i]) << (byte_idx * 8);
-    }
+// Convert 64-bit to bytes little-endian
+void u64_to_bytes_le(ulong value, uchar* bytes, int offset) {
+    bytes[offset] = (uchar)value;
+    bytes[offset + 1] = (uchar)(value >> 8);
+    bytes[offset + 2] = (uchar)(value >> 16);
+    bytes[offset + 3] = (uchar)(value >> 24);
+    bytes[offset + 4] = (uchar)(value >> 32);
+    bytes[offset + 5] = (uchar)(value >> 40);
+    bytes[offset + 6] = (uchar)(value >> 48);
+    bytes[offset + 7] = (uchar)(value >> 56);
 }
 
-// Convert 64-bit words to bytes (little-endian)
-void state_to_bytes(const ulong* state, uchar* output, int output_len) {
-    for (int i = 0; i < output_len; i++) {
-        int word_idx = i / 8;
-        int byte_idx = i % 8;
-        output[i] = (uchar)(state[word_idx] >> (byte_idx * 8));
-    }
-}
-
-// Keccak-f[1600] permutation
-void keccak_f1600(ulong* state) {
-    ulong a[25];
-    ulong c[5], d[5], b[25];
+// Keccak permutation function
+void keccak_permutation(ulong state[25]) {
+    ulong C[5], D[5], B[25];
     
-    // Copy state to working array
-    for (int i = 0; i < 25; i++) {
-        a[i] = state[i];
-    }
-    
-    // 24 rounds of Keccak-f
     for (int round = 0; round < KECCAK_ROUNDS; round++) {
         // Theta step
-        for (int x = 0; x < 5; x++) {
-            c[x] = a[x] ^ a[x + 5] ^ a[x + 10] ^ a[x + 15] ^ a[x + 20];
-        }
+        C[0] = state[0] ^ state[5] ^ state[10] ^ state[15] ^ state[20];
+        C[1] = state[1] ^ state[6] ^ state[11] ^ state[16] ^ state[21];
+        C[2] = state[2] ^ state[7] ^ state[12] ^ state[17] ^ state[22];
+        C[3] = state[3] ^ state[8] ^ state[13] ^ state[18] ^ state[23];
+        C[4] = state[4] ^ state[9] ^ state[14] ^ state[19] ^ state[24];
         
-        for (int x = 0; x < 5; x++) {
-            d[x] = c[(x + 4) % 5] ^ rotl64(c[(x + 1) % 5], 1);
-        }
+        D[0] = C[4] ^ ROTL64(C[1], 1);
+        D[1] = C[0] ^ ROTL64(C[2], 1);
+        D[2] = C[1] ^ ROTL64(C[3], 1);
+        D[3] = C[2] ^ ROTL64(C[4], 1);
+        D[4] = C[3] ^ ROTL64(C[0], 1);
         
-        for (int x = 0; x < 5; x++) {
-            for (int y = 0; y < 5; y++) {
-                a[y * 5 + x] ^= d[x];
-            }
-        }
+        state[0] ^= D[0]; state[5] ^= D[0]; state[10] ^= D[0]; state[15] ^= D[0]; state[20] ^= D[0];
+        state[1] ^= D[1]; state[6] ^= D[1]; state[11] ^= D[1]; state[16] ^= D[1]; state[21] ^= D[1];
+        state[2] ^= D[2]; state[7] ^= D[2]; state[12] ^= D[2]; state[17] ^= D[2]; state[22] ^= D[2];
+        state[3] ^= D[3]; state[8] ^= D[3]; state[13] ^= D[3]; state[18] ^= D[3]; state[23] ^= D[3];
+        state[4] ^= D[4]; state[9] ^= D[4]; state[14] ^= D[4]; state[19] ^= D[4]; state[24] ^= D[4];
         
         // Rho and Pi steps
-        b[0] = a[0];
-        for (int i = 0; i < 24; i++) {
-            b[keccak_pi_indices[i]] = rotl64(a[i + 1], keccak_rotation_offsets[i]);
-        }
+        B[0] = state[0];
+        B[1] = ROTL64(state[6], 44);
+        B[2] = ROTL64(state[12], 43);
+        B[3] = ROTL64(state[18], 21);
+        B[4] = ROTL64(state[24], 14);
+        B[5] = ROTL64(state[3], 28);
+        B[6] = ROTL64(state[9], 20);
+        B[7] = ROTL64(state[10], 3);
+        B[8] = ROTL64(state[16], 45);
+        B[9] = ROTL64(state[22], 61);
+        B[10] = ROTL64(state[1], 1);
+        B[11] = ROTL64(state[7], 6);
+        B[12] = ROTL64(state[13], 25);
+        B[13] = ROTL64(state[19], 8);
+        B[14] = ROTL64(state[20], 18);
+        B[15] = ROTL64(state[4], 27);
+        B[16] = ROTL64(state[5], 36);
+        B[17] = ROTL64(state[11], 10);
+        B[18] = ROTL64(state[17], 15);
+        B[19] = ROTL64(state[23], 56);
+        B[20] = ROTL64(state[2], 62);
+        B[21] = ROTL64(state[8], 55);
+        B[22] = ROTL64(state[14], 39);
+        B[23] = ROTL64(state[15], 41);
+        B[24] = ROTL64(state[21], 2);
         
         // Chi step
-        for (int y = 0; y < 5; y++) {
-            for (int x = 0; x < 5; x++) {
-                a[y * 5 + x] = b[y * 5 + x] ^ ((~b[y * 5 + ((x + 1) % 5)]) & b[y * 5 + ((x + 2) % 5)]);
-            }
+        for (int i = 0; i < 25; i += 5) {
+            state[i] = B[i] ^ ((~B[i + 1]) & B[i + 2]);
+            state[i + 1] = B[i + 1] ^ ((~B[i + 2]) & B[i + 3]);
+            state[i + 2] = B[i + 2] ^ ((~B[i + 3]) & B[i + 4]);
+            state[i + 3] = B[i + 3] ^ ((~B[i + 4]) & B[i]);
+            state[i + 4] = B[i + 4] ^ ((~B[i]) & B[i + 1]);
         }
         
         // Iota step
-        a[0] ^= keccak_round_constants[round];
-    }
-    
-    // Copy result back to state
-    for (int i = 0; i < 25; i++) {
-        state[i] = a[i];
-    }
-}
-
-// Keccak sponge function
-void keccak_sponge(const uchar* input, int input_len, uchar* output, int output_len) {
-    ulong state[KECCAK_STATE_SIZE];
-    uchar block[KECCAK_RATE];
-    int processed = 0;
-    
-    // Initialize state
-    for (int i = 0; i < KECCAK_STATE_SIZE; i++) {
-        state[i] = 0;
-    }
-    
-    // Absorbing phase
-    while (processed < input_len) {
-        int block_size = (input_len - processed < KECCAK_RATE) ? (input_len - processed) : KECCAK_RATE;
-        
-        // Copy input block
-        for (int i = 0; i < block_size; i++) {
-            block[i] = input[processed + i];
-        }
-        
-        // Pad block if necessary
-        for (int i = block_size; i < KECCAK_RATE; i++) {
-            block[i] = 0;
-        }
-        
-        // XOR block into state
-        for (int i = 0; i < KECCAK_RATE / 8; i++) {
-            ulong word = 0;
-            for (int j = 0; j < 8; j++) {
-                word |= ((ulong)block[i * 8 + j]) << (j * 8);
-            }
-            state[i] ^= word;
-        }
-        
-        processed += block_size;
-        
-        // Apply permutation if block was full
-        if (block_size == KECCAK_RATE) {
-            keccak_f1600(state);
-        }
-    }
-    
-    // Apply padding (Keccak uses 0x01 padding)
-    int padding_start = (input_len % KECCAK_RATE);
-    int word_idx = padding_start / 8;
-    int byte_idx = padding_start % 8;
-    
-    // Add padding bit
-    state[word_idx] ^= ((ulong)0x01) << (byte_idx * 8);
-    
-    // Add final bit at end of rate
-    state[(KECCAK_RATE - 1) / 8] ^= ((ulong)0x80) << (((KECCAK_RATE - 1) % 8) * 8);
-    
-    // Final permutation
-    keccak_f1600(state);
-    
-    // Squeezing phase
-    int output_processed = 0;
-    while (output_processed < output_len) {
-        int squeeze_size = (output_len - output_processed < KECCAK_RATE) ? (output_len - output_processed) : KECCAK_RATE;
-        
-        // Extract bytes from state
-        for (int i = 0; i < squeeze_size; i++) {
-            int state_word = i / 8;
-            int state_byte = i % 8;
-            output[output_processed + i] = (uchar)(state[state_word] >> (state_byte * 8));
-        }
-        
-        output_processed += squeeze_size;
-        
-        // Apply permutation if more output is needed
-        if (output_processed < output_len) {
-            keccak_f1600(state);
-        }
+        state[0] ^= keccak_round_constants[round];
     }
 }
 
 // Keccak-256 hash function
-void keccak256(const uchar* input, int input_len, uchar* output) {
-    keccak_sponge(input, input_len, output, KECCAK_DIGEST_SIZE);
-}
-
-// Keccak-256 hash function - global input, local output
-void keccak256_global_local(__global const uchar* input, int input_len, uchar* output) {
-    // Copy global memory to local buffer for processing
-    uchar local_input[1024]; // Adjust size as needed
-    for (int i = 0; i < input_len && i < 1024; i++) {
-        local_input[i] = input[i];
-    }
-    keccak_sponge(local_input, input_len, output, KECCAK_DIGEST_SIZE);
-}
-
-// Keccak-256 hash function - global memory version
-void keccak256_global(__global const uchar* input, int input_len, __global uchar* output) {
-    // Copy global memory to local buffer for processing
-    uchar local_input[1024]; // Adjust size as needed
-    uchar local_output[32]; // Local output buffer
-    for (int i = 0; i < input_len && i < 1024; i++) {
-        local_input[i] = input[i];
-    }
-    keccak_sponge(local_input, input_len, local_output, KECCAK_DIGEST_SIZE);
-    // Copy result back to global memory
-    for (int i = 0; i < 32; i++) {
-        output[i] = local_output[i];
-    }
-}
-
-// Convert hex character to value
-int hex_char_to_value(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
-
-// Convert value to hex character (lowercase)
-char value_to_hex_char(int value) {
-    if (value >= 0 && value <= 9) return '0' + value;
-    if (value >= 10 && value <= 15) return 'a' + (value - 10);
-    return '0';
-}
-
-// Check if character should be uppercase for EIP-55 checksum
-int should_be_uppercase(uchar hash_byte, int nibble_pos) {
-    int nibble = (nibble_pos % 2 == 0) ? (hash_byte >> 4) : (hash_byte & 0x0f);
-    return nibble >= 8;
-}
-
-// Main kernel for generating Ethereum addresses from public keys
-__kernel void generate_ethereum_addresses_kernel(
-    __global const uchar* public_keys,   // Input public keys (64 bytes each, uncompressed without 0x04 prefix)
-    __global uchar* addresses,           // Output addresses (20 bytes each)
-    __global char* address_strings,      // Output address strings (42 chars each, with 0x prefix)
-    __global int* success_flags          // Success flags
-) {
-    int gid = get_global_id(0);
+void keccak256(const uchar* input, int input_len, uchar output[32]) {
+    ulong state[25];
+    uchar block[KECCAK_RATE];
+    int block_pos = 0;
     
-    __global const uchar* pub_key = public_keys + gid * 64;
-    __global uchar* address = addresses + gid * 20;
-    __global char* address_str = address_strings + gid * 42;
+    // Initialize state to zero
+    for (int i = 0; i < 25; i++) {
+        state[i] = 0;
+    }
     
+    // Process input
+    for (int i = 0; i < input_len; i++) {
+        block[block_pos] = input[i];
+        block_pos++;
+        
+        if (block_pos == KECCAK_RATE) {
+            // Absorb block into state
+            for (int j = 0; j < KECCAK_RATE; j += 8) {
+                state[j / 8] ^= bytes_to_u64_le(block, j);
+            }
+            keccak_permutation(state);
+            block_pos = 0;
+        }
+    }
+    
+    // Padding (10*1 padding for Keccak)
+    block[block_pos] = 0x01;  // First padding bit
+    block_pos++;
+    
+    // Fill with zeros until last byte
+    while (block_pos < KECCAK_RATE - 1) {
+        block[block_pos] = 0x00;
+        block_pos++;
+    }
+    
+    // Last padding bit
+    block[KECCAK_RATE - 1] = 0x80;
+    
+    // Absorb final block
+    for (int j = 0; j < KECCAK_RATE; j += 8) {
+        state[j / 8] ^= bytes_to_u64_le(block, j);
+    }
+    keccak_permutation(state);
+    
+    // Extract output (first 32 bytes)
+    for (int i = 0; i < 4; i++) {
+        u64_to_bytes_le(state[i], output, i * 8);
+    }
+}
+
+// Convert public key to Ethereum address
+void public_key_to_address(const uchar public_key[64], uchar address[20]) {
     uchar hash[32];
-    uchar checksum_input[40];
-    uchar checksum_hash[32];
     
-    // Hash the public key (64 bytes) with Keccak-256
-    keccak256_global_local(pub_key, 64, hash);
+    // Hash the public key (excluding the 0x04 prefix for uncompressed keys)
+    keccak256(public_key, 64, hash);
     
-    // Take the last 20 bytes as the Ethereum address
+    // Take the last 20 bytes as the address
     for (int i = 0; i < 20; i++) {
         address[i] = hash[12 + i];
     }
+}
+
+// EIP-55 checksum encoding (simplified)
+void apply_eip55_checksum(const uchar address[20], char checksum_address[42]) {
+    const char hex_chars[] = "0123456789abcdef";
+    const char hex_chars_upper[] = "0123456789ABCDEF";
     
-    // Generate address string with EIP-55 checksum
-    address_str[0] = '0';
-    address_str[1] = 'x';
-    
-    // Convert address to hex string (lowercase)
+    // Convert address to hex string
+    char hex_address[40];
     for (int i = 0; i < 20; i++) {
-        checksum_input[i * 2] = value_to_hex_char(address[i] >> 4);
-        checksum_input[i * 2 + 1] = value_to_hex_char(address[i] & 0x0f);
+        hex_address[i * 2] = hex_chars[address[i] >> 4];
+        hex_address[i * 2 + 1] = hex_chars[address[i] & 0x0F];
     }
     
-    // Hash the lowercase hex string for checksum
-    keccak256(checksum_input, 40, checksum_hash);
+    // Hash the hex address
+    uchar address_hash[32];
+    keccak256((const uchar*)hex_address, 40, address_hash);
     
-    // Apply EIP-55 checksum (uppercase hex digits where hash bit is 1)
+    // Apply checksum
+    checksum_address[0] = '0';
+    checksum_address[1] = 'x';
+    
+    for (int i = 0; i < 40; i++) {
+        char c = hex_address[i];
+        if (c >= 'a' && c <= 'f') {
+            // Check if corresponding hash bit is set
+            int hash_byte = i / 2;
+            int hash_bit = (i % 2) ? 0 : 4;
+            if ((address_hash[hash_byte] >> hash_bit) & 0x08) {
+                c = hex_chars_upper[c - 'a' + 10];
+            }
+        }
+        checksum_address[2 + i] = c;
+    }
+}
+
+// Ethereum address generation kernel
+__kernel void generate_ethereum_addresses(
+    __global const uchar* public_keys,      // Input: 64-byte uncompressed public keys
+    __global uchar* addresses,              // Output: 20-byte Ethereum addresses
+    __global char* checksum_addresses,      // Output: 42-char EIP-55 checksum addresses
+    __global int* success_flags,            // Output: success flags
+    const int batch_size
+) {
+    int gid = get_global_id(0);
+    if (gid >= batch_size) return;
+    
+    // Calculate offsets
+    int public_key_offset = gid * 64;
+    int address_offset = gid * 20;
+    int checksum_offset = gid * 42;
+    
+    // Extract public key
+    uchar public_key[64];
+    for (int i = 0; i < 64; i++) {
+        public_key[i] = public_keys[public_key_offset + i];
+    }
+    
+    // Generate Ethereum address
+    uchar address[20];
+    public_key_to_address(public_key, address);
+    
+    // Copy address to output
     for (int i = 0; i < 20; i++) {
-        char high_nibble = checksum_input[i * 2];
-        char low_nibble = checksum_input[i * 2 + 1];
-        
-        // Check if high nibble should be uppercase
-        if (high_nibble >= 'a' && high_nibble <= 'f') {
-            if (should_be_uppercase(checksum_hash[i], i * 2)) {
-                high_nibble = high_nibble - 'a' + 'A';
-            }
-        }
-        
-        // Check if low nibble should be uppercase
-        if (low_nibble >= 'a' && low_nibble <= 'f') {
-            if (should_be_uppercase(checksum_hash[i], i * 2 + 1)) {
-                low_nibble = low_nibble - 'a' + 'A';
-            }
-        }
-        
-        address_str[2 + i * 2] = high_nibble;
-        address_str[2 + i * 2 + 1] = low_nibble;
+        addresses[address_offset + i] = address[i];
+    }
+    
+    // Generate EIP-55 checksum address
+    char checksum_address[42];
+    apply_eip55_checksum(address, checksum_address);
+    
+    // Copy checksum address to output
+    for (int i = 0; i < 42; i++) {
+        checksum_addresses[checksum_offset + i] = checksum_address[i];
     }
     
     success_flags[gid] = 1;
 }
 
-// Kernel for batch address generation with comparison
-__kernel void generate_and_compare_addresses_kernel(
-    __global const uchar* public_keys,   // Input public keys (64 bytes each)
-    __global const uchar* target_address, // Target address to match (20 bytes)
-    __global uchar* addresses,           // Output addresses (20 bytes each)
-    __global int* match_flags,           // Match flags (1 if address matches target)
-    __global int* success_flags          // Success flags
+// Address comparison kernel for target matching
+__kernel void compare_addresses(
+    __global const uchar* generated_addresses,  // Input: generated addresses
+    __global const uchar* target_address,       // Input: target address to match
+    __global int* match_flags,                  // Output: match flags
+    const int batch_size
 ) {
     int gid = get_global_id(0);
+    if (gid >= batch_size) return;
     
-    __global const uchar* pub_key = public_keys + gid * 64;
-    __global uchar* address = addresses + gid * 20;
+    int address_offset = gid * 20;
+    int match = 1;
     
-    uchar hash[32];
-    
-    // Hash the public key with Keccak-256
-    keccak256_global_local(pub_key, 64, hash);
-    
-    // Extract Ethereum address (last 20 bytes of hash)
+    // Compare each byte
     for (int i = 0; i < 20; i++) {
-        address[i] = hash[12 + i];
+        if (generated_addresses[address_offset + i] != target_address[i]) {
+            match = 0;
+            break;
+        }
+    }
+    
+    match_flags[gid] = match;
+}
+
+// Combined kernel for complete address generation and comparison
+__kernel void generate_and_compare_addresses(
+    __global const uchar* public_keys,          // Input: 64-byte public keys
+    __global const uchar* target_address,       // Input: 20-byte target address
+    __global uchar* addresses,                  // Output: 20-byte addresses
+    __global int* match_flags,                  // Output: match flags
+    const int batch_size
+) {
+    int gid = get_global_id(0);
+    if (gid >= batch_size) return;
+    
+    // Calculate offsets
+    int public_key_offset = gid * 64;
+    int address_offset = gid * 20;
+    
+    // Extract public key
+    uchar public_key[64];
+    for (int i = 0; i < 64; i++) {
+        public_key[i] = public_keys[public_key_offset + i];
+    }
+    
+    // Generate Ethereum address
+    uchar address[20];
+    public_key_to_address(public_key, address);
+    
+    // Copy address to output
+    for (int i = 0; i < 20; i++) {
+        addresses[address_offset + i] = address[i];
     }
     
     // Compare with target address
@@ -337,67 +323,4 @@ __kernel void generate_and_compare_addresses_kernel(
     }
     
     match_flags[gid] = match;
-    success_flags[gid] = 1;
-}
-
-// Optimized kernel for address generation from compressed public keys
-__kernel void generate_addresses_from_compressed_keys_kernel(
-    __global const uchar* compressed_keys, // Input compressed public keys (33 bytes each)
-    __global uchar* addresses,             // Output addresses (20 bytes each)
-    __global int* success_flags            // Success flags
-) {
-    int gid = get_global_id(0);
-    
-    __global const uchar* comp_key = compressed_keys + gid * 33;
-    __global uchar* address = addresses + gid * 20;
-    
-    uchar uncompressed_key[64];
-    uchar hash[32];
-    
-    // For this simplified version, we assume the input is already the uncompressed
-    // X and Y coordinates (this would need secp256k1 point decompression in practice)
-    // Copy the key data (skipping the compression prefix)
-    for (int i = 0; i < 32; i++) {
-        uncompressed_key[i] = comp_key[1 + i]; // X coordinate
-    }
-    
-    // For demonstration, we'll use a simplified approach
-    // In practice, you'd need to decompress the point to get the full Y coordinate
-    for (int i = 32; i < 64; i++) {
-        uncompressed_key[i] = 0; // Placeholder for Y coordinate
-    }
-    
-    // Hash the uncompressed public key
-    keccak256(uncompressed_key, 64, hash);
-    
-    // Extract Ethereum address
-    for (int i = 0; i < 20; i++) {
-        address[i] = hash[12 + i];
-    }
-    
-    success_flags[gid] = 1;
-}
-
-// Utility kernel for testing Keccak-256 implementation
-__kernel void test_keccak256_kernel(
-    __global const uchar* inputs,        // Test inputs
-    __global const int* input_lengths,   // Length of each input
-    __global uchar* outputs,             // Output hashes (32 bytes each)
-    __global int* success_flags          // Success flags
-) {
-    int gid = get_global_id(0);
-    
-    // Calculate input offset
-    int input_offset = 0;
-    for (int i = 0; i < gid; i++) {
-        input_offset += input_lengths[i];
-    }
-    
-    __global const uchar* input = inputs + input_offset;
-    __global uchar* output = outputs + gid * 32;
-    
-    // Compute Keccak-256 hash
-    keccak256_global(input, input_lengths[gid], output);
-    
-    success_flags[gid] = 1;
 }

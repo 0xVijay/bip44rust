@@ -10,9 +10,6 @@ use pbkdf2::pbkdf2;
 use sha2::Sha512;
 use std::str::FromStr;
 
-#[cfg(test)]
-use rand;
-
 /// PBKDF2 iteration count for BIP39 seed derivation
 const BIP39_PBKDF2_ROUNDS: u32 = 2048;
 

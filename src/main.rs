@@ -1,25 +1,24 @@
-//! Ethereum Seed Recovery Tool
-//! 
-//! A high-performance Rust/OpenCL application for recovering Ethereum seed phrases
-//! from partial information using GPU acceleration.
+//! Main application for GPU-accelerated seed phrase recovery
+//!
+//! This binary provides a command-line interface for recovering Ethereum seed phrases
+//! using GPU acceleration with OpenCL.
 
-use anyhow::{Context, Result};
+use ethereum_seed_recovery::recovery::RecoveryConfig;
+use ethereum_seed_recovery::generator::CandidateGenerator;
+use ethereum_seed_recovery::ethereum::EthereumGenerator;
+use ethereum_seed_recovery::crypto::CryptoEngine;
+use ethereum_seed_recovery::opencl::OpenCLContext;
+use ethereum_seed_recovery::monitor::{RecoveryMonitor, MonitorConfig, Checkpoint};
+use ethereum_seed_recovery::error::Result;
 use clap::{Arg, Command};
-use ethereum_seed_recovery::{
-    config::RecoveryConfig,
-    crypto::CryptoEngine,
-    ethereum::EthereumGenerator,
-    generator::CandidateGenerator,
-    monitor::{RecoveryMonitor, MonitorConfig},
-    opencl::OpenCLContext,
-};
-use std::{
-    fs,
-    sync::{Arc, Mutex},
-    time::Instant,
-};
-use tokio::time::{sleep, Duration};
-use tracing::{error, info, warn};
+use log::{info, error, warn};
+use std::fs;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
+use tokio::time::sleep;
+use anyhow::Context;
+use serde_json;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -142,7 +141,7 @@ async fn main() -> Result<()> {
     if resume {
         if let Ok(checkpoint_data) = fs::read_to_string(checkpoint_path) {
             if let Ok(checkpoint) = serde_json::from_str(&checkpoint_data) {
-                monitor.lock().unwrap().restore_from_checkpoint(&checkpoint);
+                monitor.lock().await.restore_from_checkpoint(&checkpoint);
                 info!("Resumed from checkpoint");
             } else {
                 warn!("Failed to parse checkpoint file, starting fresh");
@@ -154,10 +153,22 @@ async fn main() -> Result<()> {
 
     // Start recovery process
     let result = if let Some(opencl_ctx) = opencl_context {
-        run_gpu_recovery(&config, generator, &crypto_engine, &ethereum_generator, 
-                        &opencl_ctx, &monitor, checkpoint_path).await
+        info!("Starting GPU-accelerated recovery...");
+        
+        match run_gpu_recovery(&config, &generator, &crypto_engine, &ethereum_generator, 
+                              &opencl_ctx, &monitor, checkpoint_path).await {
+            Ok(result) => {
+                info!("GPU recovery completed successfully");
+                Ok(result)
+            }
+            Err(e) => {
+                warn!("GPU recovery failed: {}, falling back to CPU", e);
+                run_cpu_recovery(&config, &generator, &crypto_engine, &ethereum_generator, 
+                                &monitor, checkpoint_path).await
+            }
+        }
     } else {
-        run_cpu_recovery(&config, generator, &crypto_engine, &ethereum_generator, 
+        run_cpu_recovery(&config, &generator, &crypto_engine, &ethereum_generator, 
                         &monitor, checkpoint_path).await
     };
 
@@ -267,7 +278,7 @@ async fn perform_dry_run(config: &RecoveryConfig) -> Result<()> {
 
 async fn run_cpu_recovery(
     config: &RecoveryConfig,
-    generator: CandidateGenerator,
+    _generator: &CandidateGenerator,
     crypto_engine: &CryptoEngine,
     ethereum_generator: &EthereumGenerator,
     monitor: &Arc<Mutex<RecoveryMonitor>>,
@@ -278,9 +289,10 @@ async fn run_cpu_recovery(
     let target_address = EthereumGenerator::validate_address(&config.ethereum.target_address)?;
     let derivation_path = config.ethereum.derivation_path.clone();
     
-    monitor.lock().unwrap().start();
+    monitor.lock().await.start();
     
-    let mut batch_iterator = generator.batch_iterator(config.batch_size);
+    let generator_clone = CandidateGenerator::new(config)?;
+    let mut batch_iterator = generator_clone.batch_iterator(config.batch_size);
     let mut last_checkpoint = Instant::now();
     let mut processed_count = 0u64;
     
@@ -300,8 +312,8 @@ async fn run_cpu_recovery(
             let address = ethereum_generator.generate_address(&private_key.private_key)?;
             
             // Check if address matches target
-            if address.address == target_address {
-                monitor.lock().unwrap().record_match();
+            if address.address.to_string() == target_address.to_string() {
+                monitor.lock().await.record_match();
                 info!("MATCH FOUND: {}", mnemonic_str);
                 return Ok(Some(mnemonic_str));
             }
@@ -311,7 +323,7 @@ async fn run_cpu_recovery(
         let batch_duration = batch_start.elapsed();
         processed_count += batch.candidates.len() as u64;
         {
-            let mon = monitor.lock().unwrap();
+            let mon = monitor.lock().await;
             mon.update_progress(batch.candidates.len() as u64);
             
             // Simple progress logging every 1000 batches
@@ -326,7 +338,7 @@ async fn run_cpu_recovery(
         
         // Save checkpoint periodically
         if last_checkpoint.elapsed() > Duration::from_secs(300) { // Every 5 minutes
-            let checkpoint = monitor.lock().unwrap().create_checkpoint(processed_count);
+            let checkpoint = monitor.lock().await.create_checkpoint(processed_count);
             if let Ok(checkpoint_data) = serde_json::to_string(&checkpoint) {
                 let _ = fs::write(checkpoint_path, checkpoint_data);
             }
@@ -342,73 +354,157 @@ async fn run_cpu_recovery(
 
 async fn run_gpu_recovery(
     config: &RecoveryConfig,
-    generator: CandidateGenerator,
+    _generator: &CandidateGenerator,
     crypto_engine: &CryptoEngine,
     ethereum_generator: &EthereumGenerator,
-    _opencl_context: &Arc<OpenCLContext>,
+    opencl_context: &Arc<OpenCLContext>,
     monitor: &Arc<Mutex<RecoveryMonitor>>,
     checkpoint_path: &str,
 ) -> Result<Option<String>> {
-    info!("Starting GPU-accelerated recovery");
+    info!("Starting GPU recovery with OpenCL acceleration");
     
     let target_address = EthereumGenerator::validate_address(&config.ethereum.target_address)?;
-    let derivation_path = config.ethereum.derivation_path.clone();
+    let _derivation_path = config.ethereum.derivation_path.clone();
     
-    monitor.lock().unwrap().start();
+    monitor.lock().await.start();
+    let _monitoring_thread = {
+        let monitor_clone = Arc::clone(monitor);
+        tokio::spawn(async move {
+            let monitor_config = MonitorConfig::default();
+            let monitor_ref = monitor_clone.lock().await;
+            monitor_ref.start_background_monitoring(monitor_config)
+        })
+    };
     
-    let mut batch_iterator = generator.batch_iterator(config.batch_size);
-    let mut last_checkpoint = Instant::now();
-    let mut processed_count = 0u64;
-    
-    while let Some(batch_result) = batch_iterator.next() {
-        let batch = batch_result?;
-        let batch_start = Instant::now();
-        
-        // For now, fall back to CPU processing since GPU kernels are not implemented
-        // TODO: Implement GPU batch processing
-        // let gpu_batch = GpuBatch::from_crypto_batch(&batch);
-        // match opencl_context.process_batch_gpu(&gpu_batch) {
-        
-        // CPU fallback processing
-        for candidate in &batch.candidates {
-            let mnemonic_str = candidate.words.join(" ");
-            let private_key = crypto_engine.derive_private_key_from_mnemonic(&mnemonic_str, &config.ethereum.passphrase, &derivation_path)?;
-            let address = ethereum_generator.generate_address(&private_key.private_key)?;
-            
-            if address.address == target_address {
-                monitor.lock().unwrap().record_match();
-                info!("MATCH FOUND: {}", mnemonic_str);
-                return Ok(Some(mnemonic_str));
+    // Load checkpoint if available
+    let mut start_position = 0u64;
+    if std::path::Path::new(checkpoint_path).exists() {
+        if let Ok(checkpoint_data) = std::fs::read_to_string(checkpoint_path) {
+            if let Ok(checkpoint) = serde_json::from_str::<Checkpoint>(&checkpoint_data) {
+                monitor.lock().await.restore_from_checkpoint(&checkpoint);
+                start_position = checkpoint.batch_position;
+                info!("Resumed from checkpoint at position {}", start_position);
             }
         }
-        
-        // Update progress
-        let batch_duration = batch_start.elapsed();
-        {
-            let mon = monitor.lock().unwrap();
-            mon.update_progress(batch.candidates.len() as u64);
-            
-            // Simple progress logging every 1000 batches
-            if batch.candidates.len() % 1000 == 0 {
-                info!(
-                    "GPU processed {} candidates in {:.2}s",
-                    batch.candidates.len(),
-                    batch_duration.as_secs_f64()
-                );
-            }
-        }
-        
-        // Save checkpoint periodically
-        if last_checkpoint.elapsed() > Duration::from_secs(300) {
-            let checkpoint = monitor.lock().unwrap().create_checkpoint(processed_count);
-            if let Ok(checkpoint_data) = serde_json::to_string(&checkpoint) {
-                let _ = fs::write(checkpoint_path, checkpoint_data);
-            }
-            last_checkpoint = Instant::now();
-        }
-        
-        processed_count += batch.candidates.len() as u64;
     }
     
+    const BATCH_SIZE: usize = 1024; // GPU batch size
+    let mut batch_count = 0u64;
+    
+    // Generate candidates and process in batches
+    let mut generator_clone = CandidateGenerator::new(config)?;
+    generator_clone.skip_to(start_position)?;
+    
+    while !generator_clone.is_exhausted() {
+        // Generate a batch of candidates
+        match generator_clone.generate_batch(BATCH_SIZE)? {
+            Some(batch) => {
+                let candidate_strings: Vec<String> = batch.candidates.iter()
+                    .map(|c| c.phrase.clone())
+                    .collect();
+                
+                // Process the batch
+            match process_gpu_batch(
+                &candidate_strings,
+                crypto_engine,
+                ethereum_generator,
+                opencl_context,
+                &target_address.to_string(),
+            ).await {
+                Ok(Some(found_mnemonic)) => {
+                    monitor.lock().await.record_match();
+                    monitor.lock().await.stop();
+                    info!("Found matching seed phrase: {}", found_mnemonic);
+                    return Ok(Some(found_mnemonic));
+                }
+                Ok(None) => {
+                    // No match in this batch, continue
+                    monitor.lock().await.update_progress(candidate_strings.len() as u64);
+                }
+                Err(e) => {
+                    warn!("GPU batch processing failed: {}, falling back to CPU", e);
+                    return run_cpu_recovery(config, &CandidateGenerator::new(config)?, crypto_engine, ethereum_generator, monitor, checkpoint_path).await;
+                }
+            }
+            
+            // Create checkpoint every 100 batches
+            if batch_count % 100 == 0 {
+                let checkpoint = monitor.lock().await.create_checkpoint(batch_count * BATCH_SIZE as u64);
+                if let Ok(checkpoint_data) = serde_json::to_string(&checkpoint) {
+                    let _ = std::fs::write(checkpoint_path, checkpoint_data);
+                }
+            }
+                
+                batch_count += 1;
+                
+                // Check for early termination
+                if monitor.lock().await.has_match() {
+                    break;
+                }
+            }
+            None => {
+                // No more batches available
+                break;
+            }
+        }
+    }
+    
+    monitor.lock().await.stop();
+    info!("GPU recovery completed - no matches found");
     Ok(None)
+}
+
+/// Process a batch of candidates using GPU acceleration
+async fn process_gpu_batch(
+    candidates: &[String],
+    _crypto_engine: &CryptoEngine,
+    ethereum_generator: &EthereumGenerator,
+    opencl_context: &OpenCLContext,
+    target_address: &str,
+) -> Result<Option<String>> {
+    use ethereum_seed_recovery::opencl::GpuBatch;
+    
+    // Convert candidates to GPU-friendly format
+    let mut mnemonic_bytes = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        mnemonic_bytes.push(candidate.as_bytes().to_vec());
+    }
+    
+    // Create derivation path for Ethereum (m/44'/60'/0'/0/2)
+    let derivation_path = vec![44 | 0x80000000, 60 | 0x80000000, 0x80000000, 0, 2];
+    let passphrase = Vec::new(); // Empty passphrase
+    
+    // Create GPU batch
+    let gpu_batch = GpuBatch::new(mnemonic_bytes, derivation_path, passphrase);
+    
+    // Process batch on GPU
+    match opencl_context.process_batch_gpu(&gpu_batch) {
+        Ok(gpu_results) => {
+            // Check each result for address match
+            for (i, private_key) in gpu_results.private_keys.iter().enumerate() {
+                if gpu_results.success_flags[i] {
+                    // Generate Ethereum address from private key
+                    if private_key.len() >= 32 {
+                        let mut key_array = [0u8; 32];
+                        key_array.copy_from_slice(&private_key[..32]);
+                        match ethereum_generator.generate_address(&key_array) {
+                            Ok(address) => {
+                                if address.address.to_string() == target_address {
+                                    return Ok(Some(candidates[i].clone()));
+                                }
+                            }
+                            Err(e) => {
+                                 warn!("Failed to generate address from GPU result: {}", e);
+                             }
+                         }
+                     }
+                }
+            }
+            Ok(None)
+        }
+        Err(e) => {
+            // GPU processing failed, return error to trigger CPU fallback
+            Err(anyhow::anyhow!("GPU processing failed: {}", e).into())
+        }
+    }
 }
