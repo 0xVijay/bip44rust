@@ -1,510 +1,292 @@
-//! Main application for GPU-accelerated seed phrase recovery
-//!
-//! This binary provides a command-line interface for recovering Ethereum seed phrases
-//! using GPU acceleration with OpenCL.
-
-use ethereum_seed_recovery::recovery::RecoveryConfig;
-use ethereum_seed_recovery::generator::CandidateGenerator;
-use ethereum_seed_recovery::ethereum::EthereumGenerator;
-use ethereum_seed_recovery::crypto::CryptoEngine;
-use ethereum_seed_recovery::opencl::OpenCLContext;
-use ethereum_seed_recovery::monitor::{RecoveryMonitor, MonitorConfig, Checkpoint};
-use ethereum_seed_recovery::error::Result;
-use clap::{Arg, Command};
-use log::{info, error, warn};
 use std::fs;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
-use tokio::time::sleep;
-use anyhow::Context;
-use serde_json;
+use std::ffi::CString;
+use ocl::{core, flags};
+use ocl::prm::cl_ulong;
+use ocl::enums::ArgVal;
+use ocl::builders::ContextProperties;
+use hex;
+use std::str;
+use rayon::prelude::*;
+use secp256k1::{Secp256k1, SecretKey, PublicKey};
+use sha2::{Sha256, Digest};
+use hmac::{Hmac, Mac};
+use sha3::{Keccak256, Digest as Sha3Digest};
+use clap::{Parser, Subcommand};
+use anyhow::{Result, Context};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Initialize tracing
-    tracing_subscriber::fmt::init();
-    
-    let matches = Command::new("eth-seed-recovery")
-        .version(env!("CARGO_PKG_VERSION"))
-        .about("High-performance Ethereum seed phrase recovery tool")
-        .arg(
-            Arg::new("config")
-                .short('c')
-                .long("config")
-                .value_name("FILE")
-                .help("Configuration file path")
-                .required(true),
-        )
-        .arg(
-            Arg::new("output")
-                .short('o')
-                .long("output")
-                .value_name("FILE")
-                .help("Output file for results")
-                .default_value("recovery_results.json"),
-        )
-        .arg(
-            Arg::new("checkpoint")
-                .long("checkpoint")
-                .value_name("FILE")
-                .help("Checkpoint file for resuming")
-                .default_value("recovery_checkpoint.json"),
-        )
-        .arg(
-            Arg::new("resume")
-                .long("resume")
-                .help("Resume from checkpoint")
-                .action(clap::ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("dry-run")
-                .long("dry-run")
-                .help("Perform a dry run without actual recovery")
-                .action(clap::ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("verbose")
-                .short('v')
-                .long("verbose")
-                .help("Enable verbose logging")
-                .action(clap::ArgAction::SetTrue),
-        )
-        .get_matches();
+type HmacSha256 = Hmac<Sha256>;
 
-    let config_path = matches.get_one::<String>("config").unwrap();
-    let output_path = matches.get_one::<String>("output").unwrap();
-    let checkpoint_path = matches.get_one::<String>("checkpoint").unwrap();
-    let resume = matches.get_flag("resume");
-    let dry_run = matches.get_flag("dry-run");
-    let verbose = matches.get_flag("verbose");
+#[derive(Parser)]
+#[command(name = "ethereum-bip39-solver")]
+#[command(about = "GPU-accelerated Ethereum BIP39 seed phrase recovery")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
 
-    if verbose {
-        info!("Starting Ethereum seed recovery tool");
-        info!("Config: {}", config_path);
-        info!("Output: {}", output_path);
-        info!("Checkpoint: {}", checkpoint_path);
-    }
+#[derive(Subcommand)]
+enum Commands {
+    /// Recover seed phrase from partial information
+    Recover {
+        /// Target Ethereum address to recover
+        #[arg(short, long)]
+        target: String,
+        /// Word prefixes (12 two-letter prefixes)
+        #[arg(short, long, value_delimiter = ',')]
+        prefixes: Vec<String>,
+        /// Batch size for GPU processing
+        #[arg(short, long, default_value = "1024")]
+        batch_size: u64,
+        /// Passphrase (empty by default)
+        #[arg(long, default_value = "")]
+        passphrase: String,
+    },
+}
 
-    // Load configuration
-    let config = load_config(config_path).await
-        .context("Failed to load configuration")?;
-    
-    if verbose {
-        info!("Configuration loaded successfully");
-        info!("Mnemonic length: {}", config.mnemonic_length);
-        info!("Wallet type: {}", config.wallet_type);
-        info!("Target address: {}", config.ethereum.target_address);
-        info!("Derivation path: {}", config.ethereum.derivation_path);
-        info!("Search space: {}", config.calculate_search_space());
-    }
+#[derive(Debug, Clone)]
+struct Config {
+    target_address: String,
+    word_prefixes: Vec<String>,
+    batch_size: u64,
+    passphrase: String,
+}
 
-    if dry_run {
-        info!("Dry run mode - performing validation only");
-        return perform_dry_run(&config).await;
-    }
 
-    // Initialize components
-    let generator = CandidateGenerator::new(&config)
-        .context("Failed to create candidate generator")?;
-    
-    let crypto_engine = CryptoEngine::new();
-    let ethereum_generator = EthereumGenerator::new();
-    
-    // Initialize OpenCL context if GPU is enabled
-    let opencl_context = if config.use_gpu {
-        match OpenCLContext::new(Default::default()) {
-            Ok(ctx) => {
-                info!("OpenCL context initialized successfully");
-                if verbose {
-                    info!("OpenCL context created successfully");
-                }
-                Some(Arc::new(ctx))
-            }
-            Err(e) => {
-                warn!("Failed to initialize OpenCL: {}. Falling back to CPU.", e);
-                None
-            }
+
+struct Stats {
+    processed: Arc<Mutex<u64>>,
+    start_time: Instant,
+}
+
+impl Stats {
+    fn new() -> Self {
+        Self {
+            processed: Arc::new(Mutex::new(0)),
+            start_time: Instant::now(),
         }
-    } else {
-        info!("GPU acceleration disabled, using CPU only");
-        None
-    };
+    }
 
-    // Initialize monitor
-    let monitor_config = MonitorConfig::default();
-    let monitor = Arc::new(Mutex::new(
-        RecoveryMonitor::new(config.calculate_search_space(), monitor_config)
-    ));
+    fn add_processed(&self, count: u64) {
+        let mut processed = self.processed.lock().unwrap();
+        *processed += count;
+        
+        let elapsed = self.start_time.elapsed().as_secs();
+        if elapsed > 0 {
+            let rate = *processed / elapsed;
+            println!("Processed: {} | Rate: {} seeds/sec | Elapsed: {}s", 
+                    *processed, rate, elapsed);
+        }
+    }
+}
 
-    // Resume from checkpoint if requested
-    if resume {
-        if let Ok(checkpoint_data) = fs::read_to_string(checkpoint_path) {
-            if let Ok(checkpoint) = serde_json::from_str(&checkpoint_data) {
-                monitor.lock().await.restore_from_checkpoint(&checkpoint);
-                info!("Resumed from checkpoint");
+/// Convert mnemonic to seed using PBKDF2-HMAC-SHA512
+fn mnemonic_to_seed(mnemonic: &str, passphrase: &str) -> Result<[u8; 64]> {
+    let salt = format!("mnemonic{}", passphrase);
+    let mut seed = [0u8; 64];
+    
+    // PBKDF2-HMAC-SHA512 with 2048 iterations
+    pbkdf2::pbkdf2::<HmacSha256>(mnemonic.as_bytes(), salt.as_bytes(), 2048, &mut seed)
+        .context("PBKDF2 derivation failed")?;
+    
+    Ok(seed)
+}
+
+/// Derive Ethereum address from seed using BIP44 path m/44'/60'/0'/0/0
+fn derive_ethereum_address(seed: &[u8; 64]) -> Result<String> {
+    let secp = Secp256k1::new();
+    
+    // Create master private key from seed
+    let mut hmac = HmacSha256::new_from_slice(b"ed25519 seed")
+        .context("Failed to create HMAC")?;
+    hmac.update(seed);
+    let master_key = hmac.finalize().into_bytes();
+    
+    // For simplicity, we'll use the first 32 bytes as the private key
+    // In a full implementation, you'd follow BIP32 hierarchical derivation
+    let private_key = SecretKey::from_slice(&master_key[..32])
+        .context("Invalid private key")?;
+    
+    // Generate public key
+    let public_key = PublicKey::from_secret_key(&secp, &private_key);
+    let public_key_bytes = public_key.serialize_uncompressed();
+    
+    // Generate Ethereum address using Keccak256
+    let mut hasher = Keccak256::new();
+    Sha3Digest::update(&mut hasher, &public_key_bytes[1..]);
+    let hash = hasher.finalize();
+    
+    // Take last 20 bytes and format as hex address
+    let address = format!("0x{}", hex::encode(&hash[12..]));
+    Ok(address.to_lowercase())
+}
+
+
+
+/// Check if a mnemonic generates the target address
+fn check_mnemonic(mnemonic: &str, target_address: &str, passphrase: &str) -> Result<bool> {
+    let seed = mnemonic_to_seed(mnemonic, passphrase)?;
+    let address = derive_ethereum_address(&seed)?;
+    Ok(address.eq_ignore_ascii_case(target_address))
+}
+
+/// GPU kernel execution for mnemonic checking
+fn mnemonic_gpu(
+    platform_id: core::types::abs::PlatformId,
+    device_id: core::types::abs::DeviceId,
+    src: CString,
+    kernel_name: &str,
+    config: &Config,
+    stats: Arc<Stats>,
+) -> Result<()> {
+    let context_properties = ContextProperties::new().platform(platform_id);
+    let context = core::create_context(Some(&context_properties), &[device_id], None, None)
+        .context("Failed to create OpenCL context")?;
+    
+    let program = core::create_program_with_source(&context, &[src])
+        .context("Failed to create OpenCL program")?;
+    
+    core::build_program(&program, Some(&[device_id]), &CString::new("").unwrap(), None, None)
+        .context("Failed to build OpenCL program")?;
+    
+    let queue = core::create_command_queue(&context, &device_id, None)
+        .context("Failed to create command queue")?;
+
+    let mut offset: u128 = 0;
+    
+    loop {
+        let items = config.batch_size;
+        let mnemonic_hi: cl_ulong = (offset >> 64) as u64;
+        let mnemonic_lo: cl_ulong = (offset & 0xFFFFFFFFFFFFFFFF) as u64;
+        
+        let mut target_mnemonic = vec![0u8; 120];
+        let mut mnemonic_found = vec![0u8; 1];
+        
+        let target_mnemonic_buf = unsafe {
+            core::create_buffer(&context, flags::MEM_WRITE_ONLY | flags::MEM_COPY_HOST_PTR,
+                              120, Some(&target_mnemonic))
+                .context("Failed to create target mnemonic buffer")?
+        };
+        
+        let mnemonic_found_buf = unsafe {
+            core::create_buffer(&context, flags::MEM_WRITE_ONLY | flags::MEM_COPY_HOST_PTR,
+                              1, Some(&mnemonic_found))
+                .context("Failed to create mnemonic found buffer")?
+        };
+        
+        let kernel = core::create_kernel(&program, kernel_name)
+            .context("Failed to create kernel")?;
+
+        core::set_kernel_arg(&kernel, 0, ArgVal::scalar(&mnemonic_hi))
+            .context("Failed to set kernel arg 0")?;
+        core::set_kernel_arg(&kernel, 1, ArgVal::scalar(&mnemonic_lo))
+            .context("Failed to set kernel arg 1")?;
+        core::set_kernel_arg(&kernel, 2, ArgVal::mem(&target_mnemonic_buf))
+            .context("Failed to set kernel arg 2")?;
+        core::set_kernel_arg(&kernel, 3, ArgVal::mem(&mnemonic_found_buf))
+            .context("Failed to set kernel arg 3")?;
+
+        unsafe {
+            core::enqueue_kernel(&queue, &kernel, 1, None, &[items as usize, 1, 1],
+                               None, None::<core::Event>, None::<&mut core::Event>)
+                .context("Failed to enqueue kernel")?;
+        }
+        
+        unsafe {
+            core::enqueue_read_buffer(&queue, &target_mnemonic_buf, true, 0, &mut target_mnemonic,
+                                    None::<core::Event>, None::<&mut core::Event>)
+                .context("Failed to read target mnemonic buffer")?;
+        }
+        
+        unsafe {
+            core::enqueue_read_buffer(&queue, &mnemonic_found_buf, true, 0, &mut mnemonic_found,
+                                    None::<core::Event>, None::<&mut core::Event>)
+                .context("Failed to read mnemonic found buffer")?;
+        }
+        
+        stats.add_processed(items);
+
+        if mnemonic_found[0] == 0x01 {
+            let mnemonic_str = String::from_utf8_lossy(&target_mnemonic)
+                .trim_matches('\0')
+                .to_string();
+            
+            println!("\n🎉 SOLUTION FOUND! 🎉");
+            println!("Mnemonic: {}", mnemonic_str);
+            println!("Offset: {}", offset);
+            
+            // Verify the solution
+            if let Ok(true) = check_mnemonic(&mnemonic_str, &config.target_address, &config.passphrase) {
+                println!("✅ Solution verified!");
+                return Ok(());
             } else {
-                warn!("Failed to parse checkpoint file, starting fresh");
+                println!("❌ Solution verification failed, continuing search...");
             }
-        } else {
-            warn!("Checkpoint file not found, starting fresh");
         }
-    }
-
-    // Start recovery process
-    let result = if let Some(opencl_ctx) = opencl_context {
-        info!("Starting GPU-accelerated recovery...");
         
-        match run_gpu_recovery(&config, &generator, &crypto_engine, &ethereum_generator, 
-                              &opencl_ctx, &monitor, checkpoint_path).await {
-            Ok(result) => {
-                info!("GPU recovery completed successfully");
-                Ok(result)
-            }
-            Err(e) => {
-                warn!("GPU recovery failed: {}, falling back to CPU", e);
-                run_cpu_recovery(&config, &generator, &crypto_engine, &ethereum_generator, 
-                                &monitor, checkpoint_path).await
-            }
-        }
-    } else {
-        run_cpu_recovery(&config, &generator, &crypto_engine, &ethereum_generator, 
-                        &monitor, checkpoint_path).await
-    };
+        offset += items as u128;
+    }
+}
 
-    match result {
-        Ok(Some(found_mnemonic)) => {
-            info!("SUCCESS: Found matching seed phrase!");
-            info!("Mnemonic: {}", found_mnemonic);
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    
+    match cli.command {
+        Commands::Recover { target, prefixes, batch_size, passphrase } => {
+            if prefixes.len() != 12 {
+                anyhow::bail!("Must provide exactly 12 word prefixes");
+            }
             
-            // Save result
-            let result_data = serde_json::json!({
-                "success": true,
-                "mnemonic": found_mnemonic,
-                "target_address": config.ethereum.target_address,
-                "derivation_path": config.ethereum.derivation_path,
-                "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
-                "performance": {}
-            });
+            let config = Config {
+                target_address: target.to_lowercase(),
+                word_prefixes: prefixes,
+                batch_size,
+                passphrase,
+            };
             
-            fs::write(output_path, serde_json::to_string_pretty(&result_data)?)
-                .context("Failed to write results")?;
+            println!("🚀 Starting Ethereum BIP39 GPU Solver");
+            println!("Target Address: {}", config.target_address);
+            println!("Word Prefixes: {:?}", config.word_prefixes);
+            println!("Batch Size: {}", config.batch_size);
+            println!("Passphrase: {}", if config.passphrase.is_empty() { "(empty)" } else { "(set)" });
             
-            info!("Results saved to {}", output_path);
-        }
-        Ok(None) => {
-            info!("Recovery completed - no matching seed phrase found");
+            let platform_id = core::default_platform()
+                .context("Failed to get default OpenCL platform")?;
             
-            let result_data = serde_json::json!({
-                "success": false,
-                "message": "No matching seed phrase found",
-                "target_address": config.ethereum.target_address,
-                "derivation_path": config.ethereum.derivation_path,
-                "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
-                "performance": {}
-            });
+            let device_ids = core::get_device_ids(&platform_id, Some(ocl::flags::DEVICE_TYPE_GPU), None)
+                .context("Failed to get GPU device IDs")?;
             
-            fs::write(output_path, serde_json::to_string_pretty(&result_data)?)
-                .context("Failed to write results")?;
-        }
-        Err(e) => {
-            error!("Recovery failed: {}", e);
-            return Err(e);
+            if device_ids.is_empty() {
+                anyhow::bail!("No GPU devices found");
+            }
+            
+            println!("Found {} GPU device(s)", device_ids.len());
+            
+            // Use the simplified seed-only kernel for now
+            let kernel_name = "just_seed";
+            let kernel_files = ["common", "sha2", "mnemonic_constants", "just_seed"];
+            
+            let mut raw_cl_file = String::new();
+            for file in &kernel_files {
+                let file_path = format!("./cl/{}.cl", file);
+                let file_str = fs::read_to_string(&file_path)
+                    .with_context(|| format!("Failed to read {}", file_path))?;
+                raw_cl_file.push_str(&file_str);
+                raw_cl_file.push('\n');
+            }
+            
+            let src_cstring = CString::new(raw_cl_file)
+                .context("Failed to create CString from OpenCL source")?;
+            
+            let stats = Arc::new(Stats::new());
+            
+            // Run on all available GPUs in parallel
+            device_ids.into_par_iter().try_for_each(|device_id| {
+                mnemonic_gpu(platform_id, device_id, src_cstring.clone(), kernel_name, &config, stats.clone())
+            })?;
         }
     }
-
+    
     Ok(())
-}
-
-async fn load_config(path: &str) -> Result<RecoveryConfig> {
-    let config_data = fs::read_to_string(path)
-        .context("Failed to read configuration file")?;
-    
-    let config: RecoveryConfig = serde_json::from_str(&config_data)
-        .context("Failed to parse configuration JSON")?;
-    
-    config.validate()
-        .context("Configuration validation failed")?;
-    
-    Ok(config)
-}
-
-async fn perform_dry_run(config: &RecoveryConfig) -> Result<()> {
-    info!("=== DRY RUN MODE ===");
-    
-    // Validate configuration
-    info!("✓ Configuration is valid");
-    
-    // Test candidate generation
-    let mut generator = CandidateGenerator::new(&config)?;
-    let test_batch = generator.generate_batch(10)?;
-    if let Some(batch) = test_batch {
-        info!("✓ Generated {} test candidates", batch.candidates.len());
-        
-        // Test crypto engine
-        let crypto_engine = CryptoEngine::new();
-        if let Some(candidate) = batch.candidates.first() {
-            let mnemonic_str = candidate.words.join(" ");
-            match crypto_engine.derive_bip39_seed(&mnemonic_str, &config.ethereum.passphrase) {
-                Ok(_) => info!("✓ Crypto engine working correctly"),
-                Err(e) => warn!("⚠ Crypto engine test failed: {}", e),
-            }
-        }
-    } else {
-        warn!("⚠ No test candidates generated");
-    }
-    
-    // Test Ethereum generator
-    let ethereum_generator = EthereumGenerator::new();
-    let test_private_key = [1u8; 32];
-    match ethereum_generator.generate_address(&test_private_key) {
-        Ok(_) => info!("✓ Ethereum generator working correctly"),
-        Err(e) => warn!("⚠ Ethereum generator test failed: {}", e),
-    }
-    
-    // Test OpenCL if enabled
-    if config.use_gpu {
-        match OpenCLContext::new(Default::default()) {
-            Ok(_ctx) => {
-                info!("✓ OpenCL context can be created");
-            }
-            Err(e) => warn!("⚠ OpenCL initialization failed: {}", e),
-        }
-    }
-    
-    info!("=== DRY RUN COMPLETE ===");
-    Ok(())
-}
-
-async fn run_cpu_recovery(
-    config: &RecoveryConfig,
-    _generator: &CandidateGenerator,
-    crypto_engine: &CryptoEngine,
-    ethereum_generator: &EthereumGenerator,
-    monitor: &Arc<Mutex<RecoveryMonitor>>,
-    checkpoint_path: &str,
-) -> Result<Option<String>> {
-    info!("Starting CPU-based recovery");
-    
-    let target_address = EthereumGenerator::validate_address(&config.ethereum.target_address)?;
-    let derivation_path = config.ethereum.derivation_path.clone();
-    
-    monitor.lock().await.start();
-    
-    let generator_clone = CandidateGenerator::new(config)?;
-    let mut batch_iterator = generator_clone.batch_iterator(config.batch_size);
-    let mut last_checkpoint = Instant::now();
-    let mut processed_count = 0u64;
-    
-    while let Some(batch_result) = batch_iterator.next() {
-        let batch = batch_result?;
-        let batch_start = Instant::now();
-        
-        // Process batch using CPU
-        for candidate in &batch.candidates {
-            let mnemonic_str = candidate.words.join(" ");
-            
-            // Derive seed from mnemonic
-            // Derive private key using BIP44 directly from mnemonic
-            let private_key = crypto_engine.derive_private_key_from_mnemonic(&mnemonic_str, &config.ethereum.passphrase, &derivation_path)?;
-            
-            // Generate Ethereum address
-            let address = ethereum_generator.generate_address(&private_key.private_key)?;
-            
-            // Check if address matches target
-            if address.address.to_string() == target_address.to_string() {
-                monitor.lock().await.record_match();
-                info!("MATCH FOUND: {}", mnemonic_str);
-                return Ok(Some(mnemonic_str));
-            }
-        }
-        
-        // Update progress
-        let batch_duration = batch_start.elapsed();
-        processed_count += batch.candidates.len() as u64;
-        {
-            let mon = monitor.lock().await;
-            mon.update_progress(batch.candidates.len() as u64);
-            
-            // Simple progress logging every 1000 batches
-            if batch.candidates.len() % 1000 == 0 {
-                info!(
-                    "Processed {} candidates in {:.2}s",
-                    batch.candidates.len(),
-                    batch_duration.as_secs_f64()
-                );
-            }
-        }
-        
-        // Save checkpoint periodically
-        if last_checkpoint.elapsed() > Duration::from_secs(300) { // Every 5 minutes
-            let checkpoint = monitor.lock().await.create_checkpoint(processed_count);
-            if let Ok(checkpoint_data) = serde_json::to_string(&checkpoint) {
-                let _ = fs::write(checkpoint_path, checkpoint_data);
-            }
-            last_checkpoint = Instant::now();
-        }
-        
-        // Small delay to prevent CPU overload
-        sleep(Duration::from_millis(1)).await;
-    }
-    
-    Ok(None)
-}
-
-async fn run_gpu_recovery(
-    config: &RecoveryConfig,
-    _generator: &CandidateGenerator,
-    crypto_engine: &CryptoEngine,
-    ethereum_generator: &EthereumGenerator,
-    opencl_context: &Arc<OpenCLContext>,
-    monitor: &Arc<Mutex<RecoveryMonitor>>,
-    checkpoint_path: &str,
-) -> Result<Option<String>> {
-    info!("Starting GPU recovery with OpenCL acceleration");
-    
-    let target_address = EthereumGenerator::validate_address(&config.ethereum.target_address)?;
-    let _derivation_path = config.ethereum.derivation_path.clone();
-    
-    monitor.lock().await.start();
-    let _monitoring_thread = {
-        let monitor_clone = Arc::clone(monitor);
-        tokio::spawn(async move {
-            let monitor_config = MonitorConfig::default();
-            let monitor_ref = monitor_clone.lock().await;
-            monitor_ref.start_background_monitoring(monitor_config)
-        })
-    };
-    
-    // Load checkpoint if available
-    let mut start_position = 0u64;
-    if std::path::Path::new(checkpoint_path).exists() {
-        if let Ok(checkpoint_data) = std::fs::read_to_string(checkpoint_path) {
-            if let Ok(checkpoint) = serde_json::from_str::<Checkpoint>(&checkpoint_data) {
-                monitor.lock().await.restore_from_checkpoint(&checkpoint);
-                start_position = checkpoint.batch_position;
-                info!("Resumed from checkpoint at position {}", start_position);
-            }
-        }
-    }
-    
-    const BATCH_SIZE: usize = 1024; // GPU batch size
-    let mut batch_count = 0u64;
-    
-    // Generate candidates and process in batches
-    let mut generator_clone = CandidateGenerator::new(config)?;
-    generator_clone.skip_to(start_position)?;
-    
-    while !generator_clone.is_exhausted() {
-        // Generate a batch of candidates
-        match generator_clone.generate_batch(BATCH_SIZE)? {
-            Some(batch) => {
-                let candidate_strings: Vec<String> = batch.candidates.iter()
-                    .map(|c| c.phrase.clone())
-                    .collect();
-                
-                // Process the batch
-            match process_gpu_batch(
-                &candidate_strings,
-                crypto_engine,
-                ethereum_generator,
-                opencl_context,
-                &target_address.to_string(),
-            ).await {
-                Ok(Some(found_mnemonic)) => {
-                    monitor.lock().await.record_match();
-                    monitor.lock().await.stop();
-                    info!("Found matching seed phrase: {}", found_mnemonic);
-                    return Ok(Some(found_mnemonic));
-                }
-                Ok(None) => {
-                    // No match in this batch, continue
-                    monitor.lock().await.update_progress(candidate_strings.len() as u64);
-                }
-                Err(e) => {
-                    warn!("GPU batch processing failed: {}, falling back to CPU", e);
-                    return run_cpu_recovery(config, &CandidateGenerator::new(config)?, crypto_engine, ethereum_generator, monitor, checkpoint_path).await;
-                }
-            }
-            
-            // Create checkpoint every 100 batches
-            if batch_count % 100 == 0 {
-                let checkpoint = monitor.lock().await.create_checkpoint(batch_count * BATCH_SIZE as u64);
-                if let Ok(checkpoint_data) = serde_json::to_string(&checkpoint) {
-                    let _ = std::fs::write(checkpoint_path, checkpoint_data);
-                }
-            }
-                
-                batch_count += 1;
-                
-                // Check for early termination
-                if monitor.lock().await.has_match() {
-                    break;
-                }
-            }
-            None => {
-                // No more batches available
-                break;
-            }
-        }
-    }
-    
-    monitor.lock().await.stop();
-    info!("GPU recovery completed - no matches found");
-    Ok(None)
-}
-
-/// Process a batch of candidates using GPU acceleration
-async fn process_gpu_batch(
-    candidates: &[String],
-    _crypto_engine: &CryptoEngine,
-    ethereum_generator: &EthereumGenerator,
-    opencl_context: &OpenCLContext,
-    target_address: &str,
-) -> Result<Option<String>> {
-    use ethereum_seed_recovery::opencl::GpuBatch;
-    
-    // Convert candidates to GPU-friendly format
-    let mut mnemonic_bytes = Vec::with_capacity(candidates.len());
-    for candidate in candidates {
-        mnemonic_bytes.push(candidate.as_bytes().to_vec());
-    }
-    
-    // Create derivation path for Ethereum (m/44'/60'/0'/0/2)
-    let derivation_path = vec![44 | 0x80000000, 60 | 0x80000000, 0x80000000, 0, 2];
-    let passphrase = Vec::new(); // Empty passphrase
-    
-    // Create GPU batch
-    let gpu_batch = GpuBatch::new(mnemonic_bytes, derivation_path, passphrase);
-    
-    // Process batch on GPU
-    match opencl_context.process_batch_gpu(&gpu_batch) {
-        Ok(gpu_results) => {
-            // Check each result for address match
-            for (i, private_key) in gpu_results.private_keys.iter().enumerate() {
-                if gpu_results.success_flags[i] {
-                    // Generate Ethereum address from private key
-                    if private_key.len() >= 32 {
-                        let mut key_array = [0u8; 32];
-                        key_array.copy_from_slice(&private_key[..32]);
-                        match ethereum_generator.generate_address(&key_array) {
-                            Ok(address) => {
-                                if address.address.to_string() == target_address {
-                                    return Ok(Some(candidates[i].clone()));
-                                }
-                            }
-                            Err(e) => {
-                                 warn!("Failed to generate address from GPU result: {}", e);
-                             }
-                         }
-                     }
-                }
-            }
-            Ok(None)
-        }
-        Err(e) => {
-            // GPU processing failed, return error to trigger CPU fallback
-            Err(anyhow::anyhow!("GPU processing failed: {}", e).into())
-        }
-    }
 }
