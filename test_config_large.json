@@ -1,17 +1,17 @@
 {
   "word_constraints": [
-    {"position": 0, "words": ["income", "input", "inner"]},
-    {"position": 1, "words": ["bamboo", "barely", "banner"]},
-    {"position": 2, "words": ["timber", "tiny"]},
-    {"position": 3, "words": ["curtain", "cup", "culture"]},
-    {"position": 4, "words": ["buyer", "busy"]},
-    {"position": 5, "words": ["rapid", "ramp", "random", "ranch"]},
-    {"position": 6, "words": ["studio", "stuff"]},
-    {"position": 7, "words": ["across", "acid", "accuse", "acquire"]},
-    {"position": 8, "words": ["ticket", "timber"]},
-    {"position": 9, "words": ["exit", "exercise"]},
-    {"position": 10, "words": ["theme", "then", "therapy", "thesis"]},
-    {"position": 11, "words": ["decode", "decline"]}
+    {"position": 0, "words": ["income", "inch", "inner", "input", "include"]},
+    {"position": 1, "words": ["banner", "barrel", "barely", "bamboo"]},
+    {"position": 2, "words": ["title", "tiny", "tissue", "tiger", "timber"]},
+    {"position": 3, "words": ["cushion", "cup", "curtain", "culture"]},
+    {"position": 4, "words": ["butter", "busy", "bubble", "buyer"]},
+    {"position": 5, "words": ["rapid", "ramp", "rare", "random", "ranch"]},
+    {"position": 6, "words": ["student", "stuff", "studio", "stumble"]},
+    {"position": 7, "words": ["across", "acquire", "accuse", "actress", "acid"]},
+    {"position": 8, "words": ["ticket", "timber", "tide", "tiger"]},
+    {"position": 9, "words": ["excess", "exercise", "exile", "exit"]},
+    {"position": 10, "words": ["theory", "theme", "then", "thesis", "therapy"]},
+    {"position": 11, "words": ["decision", "decline", "decorate", "decode"]}
   ],
   "ethereum": {
     "derivation_path": "m/44'/60'/0'/0/2",
