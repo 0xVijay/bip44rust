@@ -1,0 +1,72 @@
+[package]
+name = "ethereum-seed-recovery"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "High-performance Ethereum seed phrase recovery tool using Rust and OpenCL"
+license = "MIT"
+repository = "https://github.com/yourusername/ethereum-seed-recovery"
+keywords = ["ethereum", "cryptocurrency", "seed-phrase", "recovery", "opencl"]
+categories = ["cryptography", "command-line-utilities"]
+
+[[bin]]
+name = "eth-seed-recovery"
+path = "src/main.rs"
+
+[dependencies]
+# Serialization and JSON handling
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Cryptography
+bip39 = "2.0"
+bitcoin = { version = "0.31", features = ["secp-recovery"] }
+secp256k1 = { version = "0.28", features = ["recovery", "global-context", "rand"] }
+sha2 = "0.10"
+hmac = "0.12"
+pbkdf2 = "0.12"
+keccak = "0.1"
+keccak-hash = "0.10"
+
+# OpenCL
+ocl = "0.19"
+
+# Async runtime
+tokio = { version = "1.0", features = ["full"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# CLI and utilities
+clap = { version = "4.0", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+indicatif = "0.17"
+rayon = "1.7"
+
+# Hex encoding/decoding
+hex = "0.4"
+
+# Random number generation
+rand = { version = "0.8", features = ["getrandom"] }
+
+# System utilities
+num_cpus = "1.0"
+
+[dev-dependencies]
+tokio-test = "0.4"
+proptest = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
+
+[features]
+default = []
+cpu-only = []

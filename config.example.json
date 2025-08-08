@@ -1,0 +1,63 @@
+{
+  "word_constraints": [
+    {
+      "position": 0,
+      "words": ["fox", "field", "flame", "family", "frequent", "flower", "frost", "frame", "famous", "february", "fade"]
+    },
+    {
+      "position": 1,
+      "words": ["lamp", "lava", "loop", "lunar", "lunch", "logic", "lobster", "lucky"]
+    },
+    {
+      "position": 2,
+      "words": ["iron", "item", "issue", "inch", "index", "infant", "invest", "inquiry"]
+    },
+    {
+      "position": 3,
+      "words": ["vivid", "vacuum", "valley", "verify", "vessel", "velvet", "vendor"]
+    },
+    {
+      "position": 4,
+      "words": ["equal", "erase", "elegant", "engineer", "engine"]
+    },
+    {
+      "position": 5,
+      "words": ["dust", "double", "dolphin", "dream", "dragon"]
+    },
+    {
+      "position": 6,
+      "words": ["hill", "hammer", "hazard", "hotel", "horse"]
+    },
+    {
+      "position": 7,
+      "words": ["glove", "grain", "giant", "guitar"]
+    },
+    {
+      "position": 8,
+      "words": ["paint", "parrot", "panic", "peach", "pear"]
+    },
+    {
+      "position": 9,
+      "words": ["yawn", "year", "yellow", "young", "old"]
+    },
+    {
+      "position": 10,
+      "words": ["road", "rise", "ring", "run", "dance"]
+    },
+    {
+      "position": 11,
+      "words": ["arrow", "asset", "attic", "armor", "shield"]
+    }
+  ],
+  "ethereum": {
+    "derivation_path": "m/44'/60'/0'/0/2",
+    "target_address": "0x543Bd35F52147370C0deCBd440863bc2a002C5c5",
+    "passphrase": ""
+  },
+  "mnemonic_length": 12,
+  "wallet_type": "ethereum",
+  "batch_size": 10000,
+  "num_threads": 8,
+  "use_gpu": true,
+  "max_memory_mb": 4096
+}
