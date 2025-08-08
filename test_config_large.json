@@ -1,0 +1,23 @@
+{
+  "word_constraints": [
+    {"position": 0, "words": ["income", "input", "inner"]},
+    {"position": 1, "words": ["bamboo", "barely", "banner"]},
+    {"position": 2, "words": ["timber", "tiny"]},
+    {"position": 3, "words": ["curtain", "cup", "culture"]},
+    {"position": 4, "words": ["buyer", "busy"]},
+    {"position": 5, "words": ["rapid", "ramp", "random", "ranch"]},
+    {"position": 6, "words": ["studio", "stuff"]},
+    {"position": 7, "words": ["across", "acid", "accuse", "acquire"]},
+    {"position": 8, "words": ["ticket", "timber"]},
+    {"position": 9, "words": ["exit", "exercise"]},
+    {"position": 10, "words": ["theme", "then", "therapy", "thesis"]},
+    {"position": 11, "words": ["decode", "decline"]}
+  ],
+  "ethereum": {
+    "derivation_path": "m/44'/60'/0'/0/2",
+    "target_address": "0x053ee470c62f02cD5bE08A50296b3cBFe171617C",
+    "passphrase": ""
+  },
+  "mnemonic_length": 12,
+  "wallet_type": "ethereum"
+}

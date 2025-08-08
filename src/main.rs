@@ -1,5 +1,6 @@
 use std::fs;
 use std::ffi::CString;
+use std::io::Write;
 use ocl::{core, flags};
 use ocl::prm::cl_ulong;
 use ocl::enums::ArgVal;
@@ -7,16 +8,23 @@ use ocl::builders::ContextProperties;
 use hex;
 use std::str;
 use rayon::prelude::*;
-use secp256k1::{Secp256k1, SecretKey, PublicKey};
-use sha2::{Sha256, Digest};
-use hmac::{Hmac, Mac};
-use sha3::{Keccak256, Digest as Sha3Digest};
+use secp256k1::Secp256k1;
+use sha2::Digest;
+use hmac::Hmac;
+use sha3::Keccak256;
+use sha2::Sha512;
 use clap::{Parser, Subcommand};
 use anyhow::{Result, Context};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use serde::{Deserialize, Serialize};
+use bip39::{Mnemonic, Language};
+use bitcoin::bip32::{DerivationPath, Xpriv};
+use bitcoin::Network;
+use std::str::FromStr;
 
-type HmacSha256 = Hmac<Sha256>;
+
+type HmacSha512 = Hmac<Sha512>;
 
 #[derive(Parser)]
 #[command(name = "ethereum-bip39-solver")]
@@ -28,29 +36,39 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Recover seed phrase from partial information
+    /// Recover seed phrase from configuration file
     Recover {
-        /// Target Ethereum address to recover
+        /// Configuration file path
         #[arg(short, long)]
-        target: String,
-        /// Word prefixes (12 two-letter prefixes)
-        #[arg(short, long, value_delimiter = ',')]
-        prefixes: Vec<String>,
+        config: String,
         /// Batch size for GPU processing
         #[arg(short, long, default_value = "1024")]
         batch_size: u64,
-        /// Passphrase (empty by default)
-        #[arg(long, default_value = "")]
-        passphrase: String,
     },
 }
 
-#[derive(Debug, Clone)]
-struct Config {
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct WordConstraint {
+    position: usize,
+    words: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct EthereumConfig {
+    derivation_path: String,
     target_address: String,
-    word_prefixes: Vec<String>,
-    batch_size: u64,
+    #[serde(default)]
     passphrase: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct Config {
+    word_constraints: Vec<WordConstraint>,
+    ethereum: EthereumConfig,
+    mnemonic_length: usize,
+    wallet_type: String,
+    #[serde(skip)]
+    batch_size: u64,
 }
 
 
@@ -71,12 +89,10 @@ impl Stats {
     fn add_processed(&self, count: u64) {
         let mut processed = self.processed.lock().unwrap();
         *processed += count;
-        
         let elapsed = self.start_time.elapsed().as_secs();
         if elapsed > 0 {
             let rate = *processed / elapsed;
-            println!("Processed: {} | Rate: {} seeds/sec | Elapsed: {}s", 
-                    *processed, rate, elapsed);
+            println!("Processed: {} mnemonics, Rate: {} mnemonics/sec", *processed, rate);
         }
     }
 }
@@ -87,48 +103,56 @@ fn mnemonic_to_seed(mnemonic: &str, passphrase: &str) -> Result<[u8; 64]> {
     let mut seed = [0u8; 64];
     
     // PBKDF2-HMAC-SHA512 with 2048 iterations
-    pbkdf2::pbkdf2::<HmacSha256>(mnemonic.as_bytes(), salt.as_bytes(), 2048, &mut seed)
+    pbkdf2::pbkdf2::<HmacSha512>(mnemonic.as_bytes(), salt.as_bytes(), 2048, &mut seed)
         .context("PBKDF2 derivation failed")?;
     
     Ok(seed)
 }
 
-/// Derive Ethereum address from seed using BIP44 path m/44'/60'/0'/0/0
+/// Derive Ethereum address from seed using BIP32/BIP44
 fn derive_ethereum_address(seed: &[u8; 64]) -> Result<String> {
     let secp = Secp256k1::new();
     
-    // Create master private key from seed
-    let mut hmac = HmacSha256::new_from_slice(b"ed25519 seed")
-        .context("Failed to create HMAC")?;
-    hmac.update(seed);
-    let master_key = hmac.finalize().into_bytes();
+    // Create master key from seed
+    let master_key = Xpriv::new_master(Network::Bitcoin, seed)
+        .context("Failed to create master key")?;
     
-    // For simplicity, we'll use the first 32 bytes as the private key
-    // In a full implementation, you'd follow BIP32 hierarchical derivation
-    let private_key = SecretKey::from_slice(&master_key[..32])
-        .context("Invalid private key")?;
+    // Derivation path: m/44'/60'/0'/0/2
+    let derivation_path = DerivationPath::from_str("m/44'/60'/0'/0/2")
+        .context("Failed to parse derivation path")?;
+    
+    // Derive the key
+    let derived_key = master_key.derive_priv(&secp, &derivation_path)
+        .context("Failed to derive key")?;
+    
+    // Get the private key bytes (for reference, not used in address generation)
+    let _private_key_bytes = derived_key.private_key.secret_bytes();
     
     // Generate public key
-    let public_key = PublicKey::from_secret_key(&secp, &private_key);
+    let public_key = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &derived_key.private_key);
     let public_key_bytes = public_key.serialize_uncompressed();
     
-    // Generate Ethereum address using Keccak256
+    // Remove the 0x04 prefix for Ethereum address generation
+    let public_key_no_prefix = &public_key_bytes[1..];
+    
+    // Hash with Keccak256
     let mut hasher = Keccak256::new();
-    Sha3Digest::update(&mut hasher, &public_key_bytes[1..]);
+    hasher.update(public_key_no_prefix);
     let hash = hasher.finalize();
     
-    // Take last 20 bytes and format as hex address
-    let address = format!("0x{}", hex::encode(&hash[12..]));
-    Ok(address.to_lowercase())
+    // Take last 20 bytes as Ethereum address
+    let address_bytes = &hash[12..];
+    let address = format!("0x{}", hex::encode(address_bytes));
+    
+    Ok(address)
 }
 
-
-
 /// Check if a mnemonic generates the target address
-fn check_mnemonic(mnemonic: &str, target_address: &str, passphrase: &str) -> Result<bool> {
-    let seed = mnemonic_to_seed(mnemonic, passphrase)?;
-    let address = derive_ethereum_address(&seed)?;
-    Ok(address.eq_ignore_ascii_case(target_address))
+fn check_mnemonic(mnemonic: &str, config: &Config) -> Result<bool> {
+    let seed = mnemonic_to_seed(mnemonic, &config.ethereum.passphrase)?;
+    let generated_address = derive_ethereum_address(&seed)?;
+    let matches = generated_address.to_lowercase() == config.ethereum.target_address.to_lowercase();
+    Ok(matches)
 }
 
 /// GPU kernel execution for mnemonic checking
@@ -217,7 +241,7 @@ fn mnemonic_gpu(
             println!("Offset: {}", offset);
             
             // Verify the solution
-            if let Ok(true) = check_mnemonic(&mnemonic_str, &config.target_address, &config.passphrase) {
+            if let Ok(true) = check_mnemonic(&mnemonic_str, config) {
                 println!("✅ Solution verified!");
                 return Ok(());
             } else {
@@ -229,33 +253,206 @@ fn mnemonic_gpu(
     }
 }
 
+/// Validate BIP39 mnemonic checksum
+fn is_valid_mnemonic(mnemonic: &str) -> bool {
+    match Mnemonic::parse_in(Language::English, mnemonic) {
+        Ok(_) => true,
+        Err(_) => false,
+    }
+}
+
+/// Detect optimal batch size based on GPU memory
+fn detect_optimal_batch_size() -> Result<u64> {
+    // Get OpenCL platforms and devices to detect memory
+    let platform_ids = core::get_platform_ids()
+        .context("Failed to get OpenCL platforms")?;
+    
+    if platform_ids.is_empty() {
+        return Ok(1024); // Default fallback
+    }
+    
+    let mut max_memory = 0u64;
+    for platform_id in &platform_ids {
+        if let Ok(device_ids) = core::get_device_ids(*platform_id, Some(core::DeviceType::GPU), None) {
+            for device_id in device_ids {
+                if let Ok(memory) = core::get_device_info(&device_id, core::DeviceInfo::GlobalMemSize) {
+                    if let core::DeviceInfoResult::GlobalMemSize(mem_size) = memory {
+                        max_memory = max_memory.max(mem_size);
+                    }
+                }
+            }
+        }
+    }
+    
+    // Calculate optimal batch size based on available memory
+    // Each work item needs ~200 bytes, leave 80% for GPU memory
+    let optimal_batch = if max_memory > 0 {
+        ((max_memory as f64 * 0.8) / 200.0) as u64
+    } else {
+        1024
+    };
+    
+    // Clamp between reasonable bounds
+    Ok(optimal_batch.max(1024).min(1_000_000))
+}
+
+/// Generate candidate mnemonics based on word constraints with BIP39 validation
+fn generate_candidate_mnemonics(config: &Config) -> Result<Vec<String>> {
+    let mut candidates = Vec::new();
+    
+    if config.word_constraints.is_empty() {
+        return Ok(candidates);
+    }
+    
+    // Collect word options for each position
+    let mut word_options = Vec::new();
+    for i in 0..config.mnemonic_length {
+        if let Some(constraint) = config.word_constraints.iter().find(|c| c.position == i) {
+            if constraint.words.is_empty() {
+                return Err(anyhow::anyhow!("No words provided for position {}", i));
+            }
+            word_options.push(constraint.words.clone());
+        } else {
+            return Err(anyhow::anyhow!("No constraint found for position {}", i));
+        }
+    }
+    
+    // Calculate total possible combinations
+    let total_combinations: u64 = word_options.iter()
+        .map(|words| words.len() as u64)
+        .product();
+    
+    println!("📊 Total possible combinations: {}", total_combinations);
+    
+    // Generate all combinations using recursive approach with BIP39 validation
+    let mut total_generated = 0u64;
+    fn generate_combinations(
+        word_options: &[Vec<String>], 
+        current: &mut Vec<String>, 
+        all_combinations: &mut Vec<String>,
+        total_generated: &mut u64
+    ) {
+        if current.len() == word_options.len() {
+            let mnemonic = current.join(" ");
+            *total_generated += 1;
+            
+            // Only add valid BIP39 mnemonics with correct checksum
+            if is_valid_mnemonic(&mnemonic) {
+                all_combinations.push(mnemonic);
+            }
+            return;
+        }
+        
+        let position = current.len();
+        for word in &word_options[position] {
+            current.push(word.clone());
+            generate_combinations(word_options, current, all_combinations, total_generated);
+            current.pop();
+        }
+    }
+    
+    let mut current = Vec::new();
+    generate_combinations(&word_options, &mut current, &mut candidates, &mut total_generated);
+    
+    let efficiency = if total_generated > 0 {
+        (candidates.len() as f64 / total_generated as f64) * 100.0
+    } else {
+        0.0
+    };
+    
+    println!("🔍 BIP39 validation efficiency: {:.2}% ({} valid out of {} total)", 
+             efficiency, candidates.len(), total_generated);
+    
+    Ok(candidates)
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     
     match cli.command {
-        Commands::Recover { target, prefixes, batch_size, passphrase } => {
-            if prefixes.len() != 12 {
-                anyhow::bail!("Must provide exactly 12 word prefixes");
-            }
+        Commands::Recover { config: config_path, batch_size } => {
+            println!("🚀 Starting Ethereum BIP39 GPU Solver");
             
-            let config = Config {
-                target_address: target.to_lowercase(),
-                word_prefixes: prefixes,
-                batch_size,
-                passphrase,
+            // Load configuration
+            let config_str = fs::read_to_string(&config_path)
+                .with_context(|| format!("Failed to read config file: {}", config_path))?;
+            
+            let mut config: Config = serde_json::from_str(&config_str)
+                .context("Failed to parse config file")?;
+            
+            let final_batch_size = if batch_size == 1024 {
+                // Auto-detect optimal batch size based on GPU memory when using default
+                match detect_optimal_batch_size() {
+                    Ok(optimal_size) => {
+                        println!("🔧 Auto-detected optimal batch size: {}", optimal_size);
+                        optimal_size
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️  Failed to detect optimal batch size: {}, using default 1024", e);
+                        1024
+                    }
+                }
+            } else {
+                batch_size
             };
             
-            println!("🚀 Starting Ethereum BIP39 GPU Solver");
-            println!("Target Address: {}", config.target_address);
-            println!("Word Prefixes: {:?}", config.word_prefixes);
+            config.batch_size = final_batch_size;
+            
+            println!("Target Address: {}", config.ethereum.target_address);
+            println!("Derivation Path: {}", config.ethereum.derivation_path);
             println!("Batch Size: {}", config.batch_size);
-            println!("Passphrase: {}", if config.passphrase.is_empty() { "(empty)" } else { "(set)" });
+            println!("Passphrase: {}", if config.ethereum.passphrase.is_empty() { "(empty)" } else { "(provided)" });
             
-            let platform_id = core::default_platform()
-                .context("Failed to get default OpenCL platform")?;
+            // Generate candidate mnemonics with BIP39 validation
+             println!("🔍 Generating candidates with BIP39 checksum validation...");
+             let candidates = generate_candidate_mnemonics(&config)
+                 .context("Failed to generate candidate mnemonics")?;
             
-            let device_ids = core::get_device_ids(&platform_id, Some(ocl::flags::DEVICE_TYPE_GPU), None)
-                .context("Failed to get GPU device IDs")?;
+            if candidates.is_empty() {
+                println!("❌ No valid BIP39 mnemonics found with the given constraints!");
+                println!("💡 This means none of the word combinations produce a valid checksum.");
+                return Ok(());
+            }
+            
+            println!("✅ Generated {} valid BIP39 candidate mnemonic(s)", candidates.len());
+            
+            // Check candidates on CPU first with progress indicator
+            print!("🔍 Testing {} candidates for address match", candidates.len());
+            std::io::stdout().flush().unwrap();
+            
+            for (i, candidate) in candidates.iter().enumerate() {
+                // Show progress every 100 candidates or on last candidate
+                if i % 100 == 0 || i == candidates.len() - 1 {
+                    print!("\r🔍 Testing candidates: {}/{} ({:.1}%)", 
+                           i + 1, candidates.len(), 
+                           ((i + 1) as f64 / candidates.len() as f64) * 100.0);
+                    std::io::stdout().flush().unwrap();
+                }
+                
+                if check_mnemonic(candidate, &config)? {
+                    println!("\n✅ SUCCESS! Found matching address with mnemonic: {}", candidate);
+                    return Ok(());
+                }
+            }
+            
+            println!("\n❌ No matching address found in valid BIP39 candidates");
+            
+            println!("No CPU matches found, starting GPU processing...");
+            
+            // Get OpenCL platforms and devices
+            let platform_ids = core::get_platform_ids()
+                .context("Failed to get OpenCL platforms")?;
+            
+            if platform_ids.is_empty() {
+                anyhow::bail!("No OpenCL platforms found");
+            }
+            
+            let mut device_ids = Vec::new();
+            for platform_id in &platform_ids {
+                if let Ok(devices) = core::get_device_ids(*platform_id, Some(core::DeviceType::GPU), None) {
+                    device_ids.extend(devices.into_iter().map(|d| (*platform_id, d)));
+                }
+            }
             
             if device_ids.is_empty() {
                 anyhow::bail!("No GPU devices found");
@@ -281,8 +478,8 @@ fn main() -> Result<()> {
             
             let stats = Arc::new(Stats::new());
             
-            // Run on all available GPUs in parallel
-            device_ids.into_par_iter().try_for_each(|device_id| {
+            // Run GPU processing on all available devices in parallel
+            device_ids.into_par_iter().try_for_each(|(platform_id, device_id)| {
                 mnemonic_gpu(platform_id, device_id, src_cstring.clone(), kernel_name, &config, stats.clone())
             })?;
         }

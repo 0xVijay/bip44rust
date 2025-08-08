@@ -2,7 +2,7 @@
   "word_constraints": [
     {
       "position": 0,
-      "words": ["frequent"]
+      "words": ["friend","frequent"]
     },
     {
       "position": 1,
@@ -14,7 +14,7 @@
     },
     {
       "position": 3,
-      "words": ["vendor"]
+      "words": ["venture", "verify", "version", "vendor"]
     },
     {
       "position": 4,
@@ -51,8 +51,7 @@
   ],
   "ethereum": {
     "derivation_path": "m/44'/60'/0'/0/2",
-    "target_address": "0x543Bd35F52147370C0deCBd440863bc2a002C5c5",
-    "passphrase": ""
+    "target_address": "0x543bd35f52147370c0decbd440863bc2a002c5c5"
   },
   "mnemonic_length": 12,
   "wallet_type": "ethereum"
