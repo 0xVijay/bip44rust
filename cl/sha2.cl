@@ -3,7 +3,7 @@
 #define mod(x,y) ((x)-((x)/(y)*(y)))
 #define shr32(x,n) ((x) >> (n))
 #define rotl32(a,n) rotate ((a), (n))
-#define rotl64(a,n) (rotate ((a), (n)))
+#define rotl64(a,n) (rotate ((ulong)(a), (ulong)(n)))
 #define rotr64(a,n) (rotate ((a), (64ul-n)))
 #define S0(x) (rotl32 ((x), 25u) ^ rotl32 ((x), 14u) ^ shr32 ((x),  3u))
 #define S1(x) (rotl32 ((x), 15u) ^ rotl32 ((x), 13u) ^ shr32 ((x), 10u))

@@ -23,10 +23,7 @@ __constant uint keccak_pi_lane[24] = {
     10, 7, 11, 17, 18, 3, 5, 16, 8, 21, 24, 4, 15, 23, 19, 13, 12, 2, 20, 14, 22, 9, 6, 1
 };
 
-// Rotate left function for 64-bit values
-ulong rotl64(ulong x, uint n) {
-    return (x << n) | (x >> (64 - n));
-}
+// Rotate left function is handled by macro in sha2.cl
 
 // Keccak-f[1600] permutation
 void keccak_f1600(ulong state[25]) {
